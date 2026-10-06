@@ -8,6 +8,18 @@ extern const struct kernel_offsets *active_offsets;
 #define _RSO(field, fallback) (active_offsets && active_offsets->field ? active_offsets->field : (fallback))
 #define _RSO_64(field, fallback) ((uint64_t)(active_offsets && active_offsets->field ? active_offsets->field : (fallback)))
 
+/* rt_mutex_waiter.pi_tree_entry offset.
+ * 5.15 compact waiter: tree_entry 0x00-0x18, pi_tree_entry 0x18-0x30,
+ *   task 0x30, lock 0x38, wake_state 0x40, prio 0x44, deadline 0x48,
+ *   ww_ctx 0x50  -> pi_tree_entry == 0x18.
+ * 6.12 (oneplus default in target.h): pi_tree_entry == 0x28.
+ * The old hard-coded 0x28 broke the 5.15 fake-fops .llseek slot and the
+ * non-FOPS pi_waiters setup (W0.pi_tree is what the [11] dequeue_pi erases,
+ * and __node_2_waiter() subtracts this same 0x18 in the kernel). */
+#undef FAKE_WAITER_PI_TREE_ENTRY_OFF
+#define FAKE_WAITER_PI_TREE_ENTRY_OFF \
+  ((active_offsets && active_offsets->waiter_compact) ? 0x18 : 0x28)
+
 #undef SYSTEM_UNBOUND_WQ_OFF
 #undef CALL_USERMODEHELPER_EXEC_WORK_OFF
 #define SYSTEM_UNBOUND_WQ_OFF            _RSO_64(off_system_unbound_wq, 0)

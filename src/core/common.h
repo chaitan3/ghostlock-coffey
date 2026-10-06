@@ -77,7 +77,11 @@
  * roundup_pow_of_two(256*num_possible_cpus()) = 1024 and was verified
  * offline: a captured collision set has exactly ONE solution in the 2GB
  * linear map at this stride). */
-#define MM_STRUCT_SZ 1024
+/* mm_cachep object stride (ALIGN(sizeof(mm_struct)+cpumask_size,64)).
+ * Per-device: set from the offsets table in select_offsets(); default 1024
+ * matches sabrina. Drives the KernelSnitch scan stride. */
+extern uint32_t g_mm_struct_sz;
+#define MM_STRUCT_SZ g_mm_struct_sz
 /* mm_cachep slab order (see above): 16KB, 16 objects, no slack. The freed
  * slab page lands on the ORDER-2 PCP, so only an ORDER-2 allocation can
  * reclaim it -> io_uring_setup(256): rings_size(256,512) = 9536 ->

