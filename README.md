@@ -143,6 +143,13 @@ cd /data/local/tmp
 ~20–40 s (leaks + spray + KernelSnitch + three overlay rounds). On success it execs
 `/system/bin/sh` **in the same adb session**; the session stays blocked until you `exit`.
 
+> **It might take a few tries — and the device can reboot during the exploit.**
+> The reclaim is probabilistic (`hits=2/3`, `[WALKCHK 0] NOT FOUND`) and a bad run can
+> corrupt kernel state enough to trip the watchdog. If the box reboots mid-run: don't
+> panic, that's expected. Let it come back, wait for adb (`adb wait-for-device`), and
+> run `./ghostlock --cred` again. Repeat until you get `hits=3/3`, `enforce=0` and
+> `init check: attr/current=…`.
+
 To use `pm` / framework tools, open a **second** adb shell (the root shell has a minimal
 environment):
 
